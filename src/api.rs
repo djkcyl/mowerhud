@@ -347,6 +347,41 @@ fn task_label(task: &Task) -> String {
     title
 }
 
+/// 先保留特殊阶段，再将普通上下班合并为 HUD 短名称。
+fn task_summary(task: &Task) -> String {
+    let title = task_label(task);
+    for label in [
+        task.display_name.as_deref().unwrap_or_default(),
+        title.as_str(),
+    ] {
+        if matches!(label, "恢复原班" | "替班交接" | "轮休协调") {
+            return label.to_string();
+        }
+    }
+    if task.task_type.display_value == "用尽下班" {
+        return "用尽下班".into();
+    }
+    // 普通上班类型不能证明已经回满，只保留接口明确给出的描述。
+    for label in [
+        title.as_str(),
+        task.display_name.as_deref().unwrap_or_default(),
+        task.task_type.display_value.as_str(),
+    ] {
+        if label.contains("用尽") || label.contains("回满") {
+            return label.to_string();
+        }
+    }
+    if matches!(task.task_type.display_value.as_str(), "上班" | "下班")
+        || title
+            .split(['；', ';'])
+            .map(str::trim)
+            .any(|part| part.ends_with("上班") || part.ends_with("下班"))
+    {
+        return "基建换班".into();
+    }
+    title
+}
+
 /// 把后端房间标识翻译成中文，镜像后端 `translate_room`。
 fn translate_room(room: &str) -> String {
     let parts: Vec<&str> = room.split('_').collect();
@@ -439,14 +474,14 @@ fn task_info_from_tasks(tasks: Vec<Task>) -> Result<Option<TaskInfo>, BoxError> 
     let next_task = parsed_tasks.get(1).map(|(task, time)| {
         let (countdown, _, _) = calculate_countdown_with_status(time);
         NextTaskInfo {
-            name: task_label(task),
+            name: task_summary(task),
             target_time: *time,
             countdown,
         }
     });
 
     Ok(Some(TaskInfo {
-        current_name: task_label(current_task),
+        current_name: task_summary(current_task),
         current_time: *current_time,
         current_countdown,
         is_expired,

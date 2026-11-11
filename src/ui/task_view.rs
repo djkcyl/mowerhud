@@ -13,6 +13,10 @@ const PANEL_MARGIN: i8 = 5;
 /// 普通/单列模式的内容高度（容纳 50pt 倒计时与按钮列；窗口宽度仍按内容自适应）。
 const NORMAL_CONTENT_H: f32 = 62.0;
 
+fn task_title(ui: &mut egui::Ui, title: &str, size: f32) -> egui::Response {
+    ui.add(egui::Label::new(egui::RichText::new(title).size(size).strong()).truncate())
+}
+
 /// 一行提示文字 + 「配置 / X」按钮，用于「已停止」「离线无数据」「加载中」等无任务态。
 /// 用固定宽度（这些是过渡态，不必紧贴内容），返回内容尺寸。
 fn show_message_row(
@@ -268,7 +272,7 @@ fn render_normal(
                     }
                 });
 
-                ui.label(egui::RichText::new(&task.current_name).size(15.0).strong());
+                task_title(ui, &task.current_name, 15.0);
 
                 if let Some(rooms) = &task.current_rooms {
                     ui.label(
@@ -316,7 +320,7 @@ fn render_normal(
                             .size(10.0)
                             .color(egui::Color32::from_rgb(150, 150, 255)),
                     );
-                    ui.label(egui::RichText::new(&next.name).size(13.0).strong());
+                    task_title(ui, &next.name, 13.0);
                     ui.label(
                         egui::RichText::new(next.target_time.format("%m-%d %H:%M").to_string())
                             .size(9.0)
@@ -339,4 +343,44 @@ fn render_normal(
         ui.add_space(10.0);
     });
     egui::vec2(resp.response.rect.width(), NORMAL_CONTENT_H)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn long_titles_stay_in_one_row_in_both_task_cards() {
+        let context = egui::Context::default();
+        for (width, size) in [(132.0, 15.0), (120.0, 13.0)] {
+            for title in [
+                "基建换班".to_string(),
+                "感知信息上班；Mon3tr、焰尾、森蚺下班".repeat(20),
+                "回满上班\n甲、乙、丙、丁".repeat(20),
+            ] {
+                let output = context.run_ui(egui::RawInput::default(), |ui| {
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 50.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                let response = super::task_title(ui, &title, size);
+                                assert!(response.rect.width() <= width + 0.1);
+                                assert!(response.rect.height() <= 30.0);
+                            },
+                        );
+                    });
+                });
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text),
+                        _ => None,
+                    })
+                    .expect("任务名称应参与实际文字布局");
+                assert_eq!(text.galley.rows.len(), 1);
+                assert_eq!(text.galley.job.text, title);
+                assert_eq!(text.galley.elided, title != "基建换班");
+            }
+        }
+    }
 }

@@ -265,6 +265,129 @@ fn legacy_task_without_presentation_uses_metadata() {
     assert_eq!(task_label(&task), "领取奖励");
 }
 
+#[test]
+fn ordinary_shifts_use_a_short_summary_without_changing_special_tasks() {
+    for (kind, title, expected) in [
+        ("上班", "感知信息上班；Mon3tr、焰尾、森蚺下班", "基建换班"),
+        ("下班", "能天使、空弦休息", "基建换班"),
+        ("纠错", "甲上班;乙下班", "基建换班"),
+        ("空任务", "甲上班；乙休息", "基建换班"),
+        ("用尽下班", "甲、乙下班", "用尽下班"),
+        ("用尽下班", "轮休协调", "轮休协调"),
+        ("上班", "回满上班", "回满上班"),
+        ("上班", "甲回满上班；乙下班", "甲回满上班；乙下班"),
+        ("跑单", "恢复原班", "恢复原班"),
+        ("纠错", "替班交接", "替班交接"),
+        ("释放宿舍空位", "释放宿舍空位", "释放宿舍空位"),
+        ("肥鸭", "肥鸭 充 能天使", "菲亚梅塔充能"),
+        ("趴体", "趴体", "线索交流"),
+        ("技能专精", "自动专精", "自动专精"),
+        ("领取邮件", "领取邮件", "领取邮件"),
+    ] {
+        let mut value = alpha_task(Local::now(), "", kind, 2);
+        value["presentation"]["title"] = json!(title);
+        let task: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(task_summary(&task), expected, "{kind}: {title}");
+    }
+}
+
+#[test]
+fn legacy_shifts_and_explicit_full_mood_names_are_preserved() {
+    for (kind, display, expected) in [
+        ("上班", "上班", "基建换班"),
+        ("下班", "下班", "基建换班"),
+        ("用尽下班", "甲下班", "用尽下班"),
+        ("上班", "回满上班", "回满上班"),
+    ] {
+        let task: Task = serde_json::from_value(json!({
+            "time":"2026-11-04T16:05:19",
+            "type":{"display_value":kind,"priority":2},
+            "display_name":display
+        }))
+        .unwrap();
+        assert_eq!(task_summary(&task), expected);
+    }
+    let mut value = alpha_task(Local::now(), "shifit_on", "上班", 2);
+    value["display_name"] = json!("回满上班");
+    value["presentation"]["title"] = json!("甲上班；乙下班");
+    let task: Task = serde_json::from_value(value).unwrap();
+    assert_eq!(task_summary(&task), "回满上班");
+}
+
+#[test]
+fn special_display_names_override_detailed_titles_in_both_task_slots() {
+    for (kind, stage, title) in [
+        ("用尽下班", "轮休协调", "但书下班"),
+        ("纠错", "替班交接", "能天使上班；空弦下班"),
+        ("跑单", "恢复原班", "但书上班"),
+    ] {
+        let mut value = alpha_task(Local::now(), "", kind, 2);
+        value["display_name"] = json!(stage);
+        value["presentation"]["title"] = json!(title);
+        let task: Task = serde_json::from_value(value).unwrap();
+        let info = task_info_from_tasks(vec![task.clone(), task])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            [
+                info.current_name.as_str(),
+                info.next_task.as_ref().unwrap().name.as_str()
+            ],
+            [stage, stage],
+            "{kind}: {title}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_existing_transports_summarize_current_and_next_tasks() {
+    for local in [false, true] {
+        let now = Local::now();
+        let mut first = alpha_task(now - ChronoDuration::minutes(1), "shifit_on", "上班", 2);
+        first["presentation"]["title"] = json!("感知信息上班；Mon3tr、焰尾下班");
+        let mut next = alpha_task(
+            now - ChronoDuration::minutes(2),
+            "exhaust_on",
+            "用尽下班",
+            2,
+        );
+        next["presentation"]["title"] = json!("能天使、空弦下班");
+        let tasks = json!([first, next]);
+        let mut config = if local {
+            serve(
+                vec![(
+                    200,
+                    json!({
+                        "protocol":"mowerhud/1", "id":"summary-instance", "mower_port":58000,
+                        "status":"sleeping", "tasks":tasks
+                    })
+                    .to_string(),
+                )],
+                None,
+            )
+        } else {
+            serve(
+                vec![
+                    (200, json!({"status":"sleeping"}).to_string()),
+                    (200, tasks.to_string()),
+                ],
+                Some("test-token"),
+            )
+        };
+        if local {
+            config.local_instance_id = Some("summary-instance".into());
+            config.local_hud_port = Some(config.port);
+        }
+        let (task, error, status) = poll_once(config, None).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(status, MowerStatus::Sleeping);
+        let task = task.unwrap();
+        assert_eq!(task.current_name, "基建换班");
+        assert!(task.is_expired);
+        assert_eq!(task.next_task.unwrap().name, "用尽下班");
+    }
+}
+
 #[tokio::test]
 async fn connection_test_rejects_unrelated_successful_http_service() {
     let config = serve(vec![(200, "<html>unrelated service</html>".into())], None);
