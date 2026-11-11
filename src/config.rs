@@ -39,6 +39,8 @@ where
 /// 注意：`password` 以明文形式存盘到 [`CONFIG_FILE`]，仅适合本地可信环境使用。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
+    #[serde(default)]
+    pub leisure: crate::leisure::LeisureConfig,
     pub host: String,
     pub port: u16,
     pub use_https: bool,
@@ -76,6 +78,7 @@ fn default_true() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            leisure: crate::leisure::LeisureConfig::default(),
             host: "127.0.0.1".to_string(),
             port: 3289,
             use_https: false,
@@ -237,5 +240,21 @@ mod tests {
         c.username = None;
         c.use_https = true;
         assert!(!c.auto_connect_to_local(false));
+    }
+
+    #[test]
+    fn leisure_settings_default_off_for_old_configs_and_persist_custom_values() {
+        let old =
+            r#"{"host":"127.0.0.1","port":3289,"use_https":false,"username":null,"password":null}"#;
+        let mut config: Config = serde_json::from_str(old).unwrap();
+        assert!(!config.leisure.enabled);
+        config.leisure.enabled = true;
+        config.leisure.min_idle_minutes = 40;
+        config.leisure.warning_minutes = 7;
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&saved).unwrap();
+        assert!(restored.leisure.enabled);
+        assert_eq!(restored.leisure.min_idle_minutes, 40);
+        assert_eq!(restored.leisure.warning_minutes, 7);
     }
 }

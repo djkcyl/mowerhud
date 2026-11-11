@@ -8,6 +8,9 @@ use crate::app::{AppState, MowerHUD};
 use crate::config::DisplayMode;
 use crate::model::{MowerStatus, TaskInfo};
 
+#[path = "leisure_view.rs"]
+mod leisure_view;
+
 /// CentralPanel 四周内边距（也是窗口尺寸要在内容之外额外加上的量）。
 const PANEL_MARGIN: i8 = 5;
 /// 普通/单列模式的内容高度（容纳 50pt 倒计时与按钮列；窗口宽度仍按内容自适应）。
@@ -49,6 +52,12 @@ fn show_message_row(
 /// 右键菜单：切换展示模式 / 置顶 / 退出。挂在背景拖动区上，任意位置右键可唤出。
 fn context_menu(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut MowerHUD) {
     ui.set_min_width(130.0);
+    if ui.button("连接与提醒设置").clicked() {
+        app.cancel_auto_connect();
+        app.state = AppState::Configuration;
+        ui.close();
+    }
+    ui.separator();
     ui.label(
         egui::RichText::new("展示模式")
             .size(11.0)
@@ -66,6 +75,11 @@ fn context_menu(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut MowerHUD) {
             app.set_display_mode(mode);
             ui.close();
         }
+    }
+    ui.separator();
+    let mut leisure_enabled = app.config.leisure.enabled;
+    if ui.checkbox(&mut leisure_enabled, "集/卫模式").changed() {
+        app.set_leisure_enabled(leisure_enabled);
     }
     ui.separator();
     if ui.selectable_label(app.always_on_top, "置顶").clicked() {
@@ -98,9 +112,11 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> egui::Vec2 {
             let bg = ui.interact(
                 ui.max_rect(),
                 ui.id().with("hud_drag_area"),
-                egui::Sense::drag(),
+                egui::Sense::click_and_drag(),
             );
-            if bg.dragged() {
+            // 普通点击不能进入系统模态拖窗；确认是左键拖动时只启动一次。
+            // drag_started_by 同时检查按键仍按下，避免松手后补发过期请求。
+            if bg.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
             bg.context_menu(|ui| context_menu(ui, &ctx, app));
@@ -120,6 +136,10 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> egui::Vec2 {
             let offline = error_msg.is_some();
             // 克隆任务快照后立即释放锁，便于按模式分函数渲染（且不在渲染期持锁）
             let task = app.task_info.try_lock().ok().and_then(|g| g.clone());
+
+            if let Some(size) = leisure_view::show(app, ui, &ctx, status, offline, task.as_ref()) {
+                return size;
+            }
 
             if let Some(task) = task {
                 // 单列：同普通但不画下一个任务那一列（show_next=false）
@@ -336,6 +356,10 @@ fn render_normal(
             );
         }
 
+        if ui.small_button("设置").clicked() {
+            app.cancel_auto_connect();
+            app.state = AppState::Configuration;
+        }
         ui.add_space(10.0);
     });
     egui::vec2(resp.response.rect.width(), NORMAL_CONTENT_H)

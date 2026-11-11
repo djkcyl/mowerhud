@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod config;
 mod discovery;
+mod leisure;
 mod model;
 mod notify;
 #[cfg(windows)]

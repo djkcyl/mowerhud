@@ -251,6 +251,48 @@ pub fn show(app: &mut MowerHUD, ui: &mut egui::Ui) -> f32 {
 
         ui.add_space(8.0);
 
+        ui.horizontal(|ui| {
+            ui.add_space(left_margin);
+            ui.checkbox(&mut app.temp_leisure.enabled, "集/卫模式");
+        });
+        if app.temp_leisure.enabled {
+            ui.horizontal(|ui| {
+                ui.add_space(left_margin);
+                ui.label("最短空档");
+                ui.add(
+                    egui::DragValue::new(&mut app.temp_leisure.min_idle_minutes)
+                        .range(2..=1440)
+                        .suffix(" 分钟"),
+                );
+            });
+            app.temp_leisure.warning_minutes = app.temp_leisure.warning_minutes.clamp(
+                1,
+                app.temp_leisure.min_idle_minutes.saturating_sub(1).max(1),
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(left_margin);
+                ui.label("提前提醒");
+                let maximum = app.temp_leisure.min_idle_minutes.saturating_sub(1).max(1);
+                ui.add(
+                    egui::DragValue::new(&mut app.temp_leisure.warning_minutes)
+                        .range(1..=maximum)
+                        .suffix(" 分钟"),
+                );
+            });
+            ui.label("观察到运行转为休眠后判断空档；接管时间为估计。");
+            ui.label("触发后显示悬浮窗；模式内使用上述提前提醒。");
+            if !app.temp_notify_enabled && !app.temp_sound_enabled {
+                ui.colored_label(
+                    if ui.visuals().dark_mode {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::from_rgb(155, 80, 0)
+                    },
+                    "通知和提示音均已关闭，届时仅显示倒计时。",
+                );
+            }
+        }
+
         // 展示模式：普通 / 单列 / 隐身（也可在运行界面右键切换）
         ui.horizontal(|ui| {
             ui.add_space(left_margin);
