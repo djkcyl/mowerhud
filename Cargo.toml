@@ -55,6 +55,10 @@ notify-rust = { version = "4.18", default-features = false, features = ["z"] }
 # winit 在 Linux 上需要一个窗口后端（x11/wayland），仅 Linux 启用。
 eframe = { version = "0.34", default-features = false, features = ["wgpu", "x11", "wayland"] }
 
+[dev-dependencies]
+# 排版回归使用内置字体，不依赖测试机器安装的字体。
+egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
+
 # 优化编译配置以最小化体积
 [profile.release]
 opt-level = "z"          # 优化体积而不是速度
