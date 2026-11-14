@@ -388,6 +388,32 @@ async fn both_existing_transports_summarize_current_and_next_tasks() {
     }
 }
 
+#[test]
+fn special_raw_titles_survive_appended_room_targets() {
+    for (kind, stage) in [
+        ("用尽下班", "轮休协调"),
+        ("纠错", "替班交接"),
+        ("跑单", "恢复原班"),
+    ] {
+        for display in [json!(null), json!(kind)] {
+            for plan in [json!(null), json!({})] {
+                let mut value = alpha_task(Local::now(), "", kind, 2);
+                value["display_name"] = display.clone();
+                value["plan"] = plan;
+                value["presentation"]["title"] = json!(stage);
+                value["presentation"]["targets"] = json!([{"id":"room_2_1","label":"贸易站 B201"}]);
+                let task: Task = serde_json::from_value(value).unwrap();
+                assert_eq!(task_label(&task), format!("{stage} · 贸易站 B201"));
+                let info = task_info_from_tasks(vec![task.clone(), task])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.current_name, stage);
+                assert_eq!(info.next_task.unwrap().name, stage);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn connection_test_rejects_unrelated_successful_http_service() {
     let config = serve(vec![(200, "<html>unrelated service</html>".into())], None);

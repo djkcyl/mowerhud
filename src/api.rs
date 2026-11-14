@@ -352,6 +352,10 @@ fn task_summary(task: &Task) -> String {
     let title = task_label(task);
     for label in [
         task.display_name.as_deref().unwrap_or_default(),
+        task.presentation
+            .as_ref()
+            .map(|presentation| presentation.title.as_str())
+            .unwrap_or_default(),
         title.as_str(),
     ] {
         if matches!(label, "恢复原班" | "替班交接" | "轮休协调") {
