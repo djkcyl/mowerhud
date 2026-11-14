@@ -3,6 +3,7 @@
 use crate::api;
 use crate::config::{Config, DisplayMode, load_config, save_config};
 use crate::discovery::{self, MowerInstance, ScanState};
+use crate::leisure::{Alert, LeisureConfig, LeisureState};
 use crate::model::{MowerStatus, TaskInfo, calculate_countdown_with_status};
 use crate::notify::{play_beep_sound, send_notification};
 use crate::ui;
@@ -34,6 +35,9 @@ fn fire_alert(notify_enabled: bool, sound_enabled: bool, task_name: &str, messag
 }
 
 pub struct MowerHUD {
+    pub leisure: LeisureState,
+    leisure_popup: bool,
+    pub temp_leisure: LeisureConfig,
     pub state: AppState,
     pub config: Config,
     pub task_info: Arc<Mutex<Option<TaskInfo>>>,
@@ -81,8 +85,8 @@ pub struct MowerHUD {
     /// 隐身模式的系统托盘（仅 Windows，创建失败为 None）。持有以保活。
     #[cfg(windows)]
     tray: Option<crate::tray::Tray>,
-    /// 当前后台轮询任务句柄。重新启动时先 abort 上一个，避免多个 loop 抢写共享状态。
-    fetch_task: Option<tokio::task::JoinHandle<()>>,
+    /// 当前后台轮询句柄及其使用的配置，用于区分提醒修改和连接修改。
+    fetch_task: Option<(tokio::task::JoinHandle<()>, Config)>,
 }
 
 impl MowerHUD {
@@ -111,6 +115,9 @@ impl MowerHUD {
             crate::tray::Tray::new(cc.egui_ctx.clone(), tray_status.clone(), tray_mode.clone());
 
         let hud = Self {
+            leisure: LeisureState::default(),
+            leisure_popup: false,
+            temp_leisure: config.leisure.clone(),
             state: AppState::Configuration,
             temp_address: format!("{}:{}", config.host, config.port),
             temp_use_https: config.use_https,
@@ -152,6 +159,7 @@ impl MowerHUD {
 
     /// 切换展示模式：更新状态、存盘。窗口可见性/尺寸由 ui() 每帧据此调整。
     pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        self.leisure_popup = false;
         if self.display_mode == mode {
             return;
         }
@@ -286,10 +294,16 @@ impl MowerHUD {
         }
     }
 
-    /// 启动后台任务轮询。先停掉上一轮，并清掉旧的任务/错误/状态，
-    /// 避免「改配置后重启」时新旧两个 loop 同时写共享状态导致 UI 闪烁。
+    /// 连接未变时沿用活跃轮询；更换连接或轮询已退出时才重启并清理状态。
     pub fn start_task_fetching(&mut self) {
-        if let Some(handle) = self.fetch_task.take() {
+        if self.fetch_task.as_ref().is_some_and(|(handle, config)| {
+            !handle.is_finished() && config.same_connection(&self.config)
+        }) {
+            return;
+        }
+        self.leisure = LeisureState::default();
+        self.leisure_popup = false;
+        if let Some((handle, _)) = self.fetch_task.take() {
             handle.abort();
         }
         // 换一组全新的共享句柄：abort 是协作式的，旧 loop 可能还有在途 HTTP 响应没返回，
@@ -304,9 +318,11 @@ impl MowerHUD {
         let task_error = self.task_error.clone();
         let mower_status = self.mower_status.clone();
         let config = self.config.clone();
-        self.fetch_task = Some(tokio::spawn(async move {
+        let fetch_config = config.clone();
+        let handle = tokio::spawn(async move {
             api::fetch_state_loop(task_info, task_error, mower_status, config).await;
-        }));
+        });
+        self.fetch_task = Some((handle, fetch_config));
     }
 
     /// 用临时字段测试 API 连接，结果写入 `connection_status`。
@@ -339,11 +355,15 @@ impl MowerHUD {
     pub fn save_and_start(&mut self) -> bool {
         match self.build_config_from_temp() {
             Ok(config) => {
-                self.config = config;
-                if let Err(e) = save_config(&self.config) {
+                if let Err(e) = save_config(&config) {
                     self.set_status(format!("保存配置失败: {}", e));
                     return false;
                 }
+                if self.config.leisure.enabled != config.leisure.enabled {
+                    self.leisure = LeisureState::default();
+                    self.leisure_popup = false;
+                }
+                self.config = config;
                 self.set_status("配置已保存".to_string());
                 true
             }
@@ -362,6 +382,14 @@ impl MowerHUD {
             &self.temp_password,
         )?;
         config.notify_enabled = self.temp_notify_enabled;
+        config.leisure = self.temp_leisure.clone();
+        if config.leisure.min_idle_minutes < 2
+            || config.leisure.min_idle_minutes > 1440
+            || config.leisure.warning_minutes == 0
+            || config.leisure.warning_minutes >= config.leisure.min_idle_minutes
+        {
+            return Err("集/卫模式：空档须为 2–1440 分钟，提前提醒须小于空档且至少 1 分钟".into());
+        }
         config.sound_enabled = self.temp_sound_enabled;
         let token = self.temp_token.trim();
         config.token = (!token.is_empty()).then(|| token.to_string());
@@ -396,12 +424,75 @@ impl MowerHUD {
         }
     }
 
+    pub fn set_leisure_enabled(&mut self, enabled: bool) {
+        self.config.leisure.enabled = enabled;
+        self.temp_leisure = self.config.leisure.clone();
+        self.leisure = LeisureState::default();
+        self.leisure_popup = false;
+        if let Err(error) = save_config(&self.config) {
+            self.set_status(format!("保存模式设置失败: {error}"));
+        }
+    }
+
+    fn tick_leisure(&mut self) {
+        // 与后台发布使用相同锁顺序，读取同一轮状态、错误和任务。
+        // 锁竞争只是暂时读不到，不代表离线、空队列或 Unknown；下一帧重试。
+        let (status, online, task) = {
+            let Ok(status) = self.mower_status.try_lock() else {
+                return;
+            };
+            let Ok(error) = self.task_error.try_lock() else {
+                return;
+            };
+            let Ok(task) = self.task_info.try_lock() else {
+                return;
+            };
+            (*status, error.is_none(), task.clone())
+        };
+        let remaining = task.as_ref().map(|task| {
+            task.current_time
+                .signed_duration_since(Local::now())
+                .num_seconds()
+        });
+        let alert = self
+            .leisure
+            .update(&self.config.leisure, status, online, remaining);
+        let seconds = remaining.unwrap_or(0).max(0);
+        if alert == Some(Alert::Available) {
+            self.leisure_popup = true;
+        } else if !self.leisure.active {
+            self.leisure_popup = false;
+        }
+        let message = match alert {
+            Some(Alert::Available) => format!(
+                "检测到休眠，预计距 Mower 接管还有 {} 分钟，可安排集/卫游玩",
+                seconds / 60
+            ),
+            Some(Alert::ReturnSoon) => format!(
+                "Mower 预计将在 {} 分 {} 秒后接管，请准备结束游玩",
+                seconds / 60,
+                seconds % 60
+            ),
+            Some(Alert::TakingOver) => "Mower 已恢复运行，可能提前接管账号或设备".to_string(),
+            Some(Alert::Due) => "预计接管时间已到，请留意 Mower 运行状态".to_string(),
+            Some(Alert::Uncertain) => "Mower 状态或连接已改变，预计接管时间暂不可确认".to_string(),
+            None => return,
+        };
+        fire_alert(
+            self.config.notify_enabled,
+            self.config.sound_enabled,
+            "集/卫模式",
+            &message,
+        );
+    }
+
     /// 每秒推进倒计时并按阈值发送提醒。
     fn tick(&mut self) {
         if self.last_update.elapsed() < Duration::from_secs(1) {
             return;
         }
 
+        self.tick_leisure();
         // 提前取出提醒开关，避免在持有 task_info 锁时再借用 self
         let notify_enabled = self.config.notify_enabled;
         let sound_enabled = self.config.sound_enabled;
@@ -439,7 +530,7 @@ impl MowerHUD {
             self.notified_30sec = false;
         }
 
-        if connection_ok && !is_expired && remaining > 0 {
+        if !self.config.leisure.enabled && connection_ok && !is_expired && remaining > 0 {
             if !self.notified_2min
                 && remaining <= NOTIFY_AHEAD_2MIN
                 && remaining > NOTIFY_AHEAD_30SEC
@@ -489,6 +580,9 @@ impl MowerHUD {
     /// 是否应隐藏窗口：仅当选了隐身、且确有托盘能把它找回时才隐藏。否则（托盘创建失败、
     /// 或非 Windows 无托盘）退化为正常显示——避免窗口与托盘双失、彻底无法操作的死局。
     fn should_hide(&self) -> bool {
+        if self.config.leisure.enabled && self.leisure.active && self.leisure_popup {
+            return false;
+        }
         if self.display_mode != DisplayMode::Stealth {
             return false;
         }
@@ -529,6 +623,14 @@ impl eframe::App for MowerHUD {
 
         let interval_ms = match self.state {
             AppState::Configuration => {
+                // 编辑设置不停止已启动的轮询和提醒，仍使用保存过的配置。
+                if self
+                    .fetch_task
+                    .as_ref()
+                    .is_some_and(|(handle, _)| !handle.is_finished())
+                {
+                    self.tick();
+                }
                 // 配置界面始终可见；尺寸按内容自适应，放在 ui() 里测量后设置。
                 self.set_window_visible(ctx, true);
                 // 配置界面也可拖动，需在此记忆位置：否则拖动后未进运行态就退出会丢失位置。
@@ -592,3 +694,6 @@ impl eframe::App for MowerHUD {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

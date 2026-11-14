@@ -161,34 +161,12 @@ pub async fn fetch_state_loop(
 
         match fetch_status(&client, &config).await {
             Ok(status) => {
-                if let Ok(mut guard) = mower_status.lock() {
-                    *guard = status;
-                }
-                if status == MowerStatus::Stopped {
-                    // 已停止：没有任务，清空残留任务与错误，让 UI 展示“已停止”。
-                    if let Ok(mut guard) = task_info.lock() {
-                        *guard = None;
-                    }
-                    if let Ok(mut guard) = task_error.lock() {
-                        *guard = None;
-                    }
+                let result = if status == MowerStatus::Stopped {
+                    Ok(None)
                 } else {
-                    match fetch_earliest_task(&client, &config).await {
-                        Ok(task) => {
-                            if let Ok(mut guard) = task_info.lock() {
-                                *guard = task;
-                            }
-                            if let Ok(mut guard) = task_error.lock() {
-                                *guard = None;
-                            }
-                        }
-                        Err(e) => {
-                            if let Ok(mut guard) = task_error.lock() {
-                                *guard = Some(e.to_string());
-                            }
-                        }
-                    }
-                }
+                    fetch_earliest_task(&client, &config).await
+                };
+                publish_state(&task_info, &task_error, &mower_status, status, result);
             }
             Err(e) => {
                 // 整个后端不可达：保留上次任务与状态，仅标记离线。
@@ -197,6 +175,34 @@ pub async fn fetch_state_loop(
                 }
             }
         }
+    }
+}
+
+/// 同轮网络请求结束后一起发布；锁顺序与 tick_leisure 一致。
+/// 持锁期间不执行网络请求，失败时保留缓存任务并标记错误。
+fn publish_state(
+    task_info: &Mutex<Option<TaskInfo>>,
+    task_error: &Mutex<Option<String>>,
+    mower_status: &Mutex<MowerStatus>,
+    status: MowerStatus,
+    result: Result<Option<TaskInfo>, BoxError>,
+) {
+    let Ok(mut status_guard) = mower_status.lock() else {
+        return;
+    };
+    let Ok(mut error_guard) = task_error.lock() else {
+        return;
+    };
+    let Ok(mut task_guard) = task_info.lock() else {
+        return;
+    };
+    *status_guard = status;
+    match result {
+        Ok(task) => {
+            *task_guard = task;
+            *error_guard = None;
+        }
+        Err(error) => *error_guard = Some(error.to_string()),
     }
 }
 
@@ -238,15 +244,7 @@ async fn fetch_local_state_loop(
         };
         match result {
             Ok((status, task)) => {
-                if let Ok(mut guard) = mower_status.lock() {
-                    *guard = status;
-                }
-                if let Ok(mut guard) = task_info.lock() {
-                    *guard = task;
-                }
-                if let Ok(mut guard) = task_error.lock() {
-                    *guard = None;
-                }
+                publish_state(&task_info, &task_error, &mower_status, status, Ok(task));
             }
             Err(error) => {
                 if port.take().is_some() {

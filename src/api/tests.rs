@@ -334,3 +334,74 @@ async fn live_local_hud_reconnection() {
     assert!(error.lock().unwrap().is_none());
     handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_is_not_published_until_task_request_finishes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = Config {
+        port: listener.local_addr().unwrap().port(),
+        ..Default::default()
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        for path in ["/status", "/task"] {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .starts_with(&format!("GET {path} "))
+            );
+            let body = if path == "/status" {
+                json!({"status":"sleeping"}).to_string()
+            } else {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                json!([alpha_task(
+                    Local::now() + ChronoDuration::hours(1),
+                    "",
+                    "上班",
+                    2
+                )])
+                .to_string()
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let task = Arc::new(Mutex::new(None));
+    let error = Arc::new(Mutex::new(None));
+    let status = Arc::new(Mutex::new(MowerStatus::Working));
+    let handle = tokio::spawn(fetch_state_loop(
+        task.clone(),
+        error,
+        status.clone(),
+        config,
+    ));
+    ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let during_task_request = *status.lock().unwrap();
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while task.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    server.join().unwrap();
+    assert_eq!(
+        during_task_request,
+        MowerStatus::Working,
+        "do not expose a new status with old task data"
+    );
+    assert_eq!(*status.lock().unwrap(), MowerStatus::Sleeping);
+}
